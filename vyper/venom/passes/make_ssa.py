@@ -1,8 +1,6 @@
 from vyper.utils import OrderedSet
-from vyper.venom.analysis import calculate_cfg, calculate_liveness
+from vyper.venom.analysis import CFGAnalysis, DominatorTreeAnalysis, LivenessAnalysis
 from vyper.venom.basicblock import IRBasicBlock, IRInstruction, IROperand, IRVariable
-from vyper.venom.dominators import DominatorTree
-from vyper.venom.function import IRFunction
 from vyper.venom.passes.base_pass import IRPass
 
 
@@ -11,32 +9,34 @@ class MakeSSA(IRPass):
     This pass converts the function into Static Single Assignment (SSA) form.
     """
 
-    dom: DominatorTree
+    dom: DominatorTreeAnalysis
     defs: dict[IRVariable, OrderedSet[IRBasicBlock]]
 
-    def _run_pass(self, ctx: IRFunction, entry: IRBasicBlock) -> int:
-        self.ctx = ctx
+    def run_pass(self):
+        fn = self.function
 
-        calculate_cfg(ctx)
-        self.dom = DominatorTree.build_dominator_tree(ctx, entry)
+        self.analyses_cache.request_analysis(CFGAnalysis)
+        self.dom = self.analyses_cache.request_analysis(DominatorTreeAnalysis)
 
-        calculate_liveness(ctx)
+        # Request liveness analysis so the `liveness_in_vars` field is valid
+        self.analyses_cache.request_analysis(LivenessAnalysis)
+
         self._add_phi_nodes()
 
         self.var_name_counters = {var.name: 0 for var in self.defs.keys()}
         self.var_name_stacks = {var.name: [0] for var in self.defs.keys()}
-        self._rename_vars(entry)
-        self._remove_degenerate_phis(entry)
+        self._rename_vars(fn.entry)
+        self._remove_degenerate_phis(fn.entry)
 
-        return 0
+        self.analyses_cache.invalidate_analysis(LivenessAnalysis)
 
     def _add_phi_nodes(self):
         """
         Add phi nodes to the function.
         """
         self._compute_defs()
-        work = {var: 0 for var in self.dom.dfs_walk}
-        has_already = {var: 0 for var in self.dom.dfs_walk}
+        work = {bb: 0 for bb in self.dom.dfs_walk}
+        has_already = {bb: 0 for bb in self.dom.dfs_walk}
         i = 0
 
         # Iterate over all variables
@@ -56,7 +56,7 @@ class MakeSSA(IRPass):
                         defs.append(dom)
 
     def _place_phi(self, var: IRVariable, basic_block: IRBasicBlock):
-        if var not in basic_block.in_vars:
+        if var not in basic_block.liveness_in_vars:
             return
 
         args: list[IROperand] = []
@@ -68,24 +68,6 @@ class MakeSSA(IRPass):
             args.append(var)  # type: ignore
 
         basic_block.insert_instruction(IRInstruction("phi", args, var), 0)
-
-    def _add_phi(self, var: IRVariable, basic_block: IRBasicBlock) -> bool:
-        for inst in basic_block.instructions:
-            if inst.opcode == "phi" and inst.output is not None and inst.output.name == var.name:
-                return False
-
-        args: list[IROperand] = []
-        for bb in basic_block.cfg_in:
-            if bb == basic_block:
-                continue
-
-            args.append(bb.label)
-            args.append(var)
-
-        phi = IRInstruction("phi", args, var)
-        basic_block.instructions.insert(0, phi)
-
-        return True
 
     def _rename_vars(self, basic_block: IRBasicBlock):
         """
@@ -114,7 +96,6 @@ class MakeSSA(IRPass):
                 self.var_name_counters[v_name] = i + 1
 
                 inst.output = IRVariable(v_name, version=i)
-                # note - after previous line, inst.output.name != v_name
                 outs.append(inst.output.name)
 
         for bb in basic_block.cfg_out:
@@ -124,8 +105,9 @@ class MakeSSA(IRPass):
                 assert inst.output is not None, "Phi instruction without output"
                 for i, op in enumerate(inst.operands):
                     if op == basic_block.label:
+                        var = inst.operands[i + 1]
                         inst.operands[i + 1] = IRVariable(
-                            inst.output.name, version=self.var_name_stacks[inst.output.name][-1]
+                            var.name, version=self.var_name_stacks[var.name][-1]
                         )
 
         for bb in self.dom.dominated[basic_block]:

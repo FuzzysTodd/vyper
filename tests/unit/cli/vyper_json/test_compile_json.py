@@ -9,6 +9,7 @@ from vyper.cli.vyper_json import (
     compile_json,
     exc_handler_to_dict,
     get_inputs,
+    get_settings,
 )
 from vyper.compiler import OUTPUT_FORMATS, compile_code, compile_from_file_input
 from vyper.compiler.input_bundle import JSONInputBundle
@@ -72,7 +73,7 @@ BAR_ABI = [
 
 
 @pytest.fixture(scope="function")
-def input_json():
+def input_json(optimize, evm_version, experimental_codegen, debug):
     return {
         "language": "Vyper",
         "sources": {
@@ -81,7 +82,13 @@ def input_json():
             "contracts/bar.vy": {"content": BAR_CODE},
         },
         "interfaces": {"contracts/ibar.json": {"abi": BAR_ABI}},
-        "settings": {"outputSelection": {"*": ["*"]}},
+        "settings": {
+            "outputSelection": {"*": ["*"]},
+            "optimize": optimize.name.lower(),
+            "evmVersion": evm_version,
+            "experimentalCodegen": experimental_codegen,
+            "debug": debug,
+        },
     }
 
 
@@ -166,12 +173,15 @@ def test_compile_json(input_json, input_bundle):
             "userdoc": data["userdoc"],
             "metadata": data["metadata"],
             "evm": {
-                "bytecode": {"object": data["bytecode"], "opcodes": data["opcodes"]},
+                "bytecode": {
+                    "object": data["bytecode"],
+                    "opcodes": data["opcodes"],
+                    "sourceMap": data["source_map"],
+                },
                 "deployedBytecode": {
                     "object": data["bytecode_runtime"],
                     "opcodes": data["opcodes_runtime"],
-                    "sourceMap": data["source_map"]["pc_pos_map_compressed"],
-                    "sourceMapFull": data["source_map_full"],
+                    "sourceMap": data["source_map_runtime"],
                 },
                 "methodIdentifiers": data["method_identifiers"],
             },
@@ -222,11 +232,6 @@ def test_different_outputs(input_bundle, input_json):
     assert foo["evm"]["methodIdentifiers"] == method_identifiers
 
 
-def test_root_folder_not_exists(input_json):
-    with pytest.raises(FileNotFoundError):
-        compile_json(input_json, root_folder="/path/that/does/not/exist")
-
-
 def test_wrong_language():
     with pytest.raises(JSONError):
         compile_json({"language": "Solidity"})
@@ -234,7 +239,7 @@ def test_wrong_language():
 
 def test_exc_handler_raises_syntax(input_json):
     input_json["sources"]["badcode.vy"] = {"content": BAD_SYNTAX_CODE}
-    with pytest.raises(SyntaxException):
+    with pytest.raises(SyntaxException, match=r'contract "badcode\.vy:\d+"'):
         compile_json(input_json)
 
 
@@ -266,7 +271,7 @@ def test_exc_handler_to_dict_compiler(input_json):
 
 
 def test_source_ids_increment(input_json):
-    input_json["settings"]["outputSelection"] = {"*": ["ast", "evm.deployedBytecode.sourceMapFull"]}
+    input_json["settings"]["outputSelection"] = {"*": ["ast", "evm.deployedBytecode.sourceMap"]}
     result = compile_json(input_json)
 
     def get(filename, contractname):
@@ -275,7 +280,7 @@ def test_source_ids_increment(input_json):
 
         # grab it via source map to sanity check
         contract_info = result["contracts"][filename][contractname]["evm"]
-        pc_ast_map = contract_info["deployedBytecode"]["sourceMapFull"]["pc_ast_map"]
+        pc_ast_map = contract_info["deployedBytecode"]["sourceMap"]["pc_ast_map"]
         pc_item = next(iter(pc_ast_map.values()))
         source_id, node_id = pc_item
         assert ret == source_id
@@ -290,5 +295,65 @@ def test_source_ids_increment(input_json):
 def test_relative_import_paths(input_json):
     input_json["sources"]["contracts/potato/baz/baz.vy"] = {"content": "from ... import foo"}
     input_json["sources"]["contracts/potato/baz/potato.vy"] = {"content": "from . import baz"}
-    input_json["sources"]["contracts/potato/footato.vy"] = {"content": "from baz import baz"}
+    input_json["sources"]["contracts/potato/footato.vy"] = {"content": "from .baz import baz"}
     compile_from_input_dict(input_json)
+
+
+def test_compile_json_with_abi_top(make_input_bundle):
+    stream = """
+{
+  "abi": [
+    {
+      "name": "validate",
+      "inputs": [
+        { "name": "creator", "type": "address" },
+        { "name": "token", "type": "address" },
+        { "name": "amount_per_second", "type": "uint256" },
+        { "name": "reason", "type": "bytes" }
+      ],
+      "outputs": [{ "name": "max_stream_life", "type": "uint256" }]
+    }
+  ]
+}
+    """
+    code = """
+from . import stream
+    """
+    input_bundle = make_input_bundle({"stream.json": stream, "code.vy": code})
+    file_input = input_bundle.load_file("code.vy")
+    vyper.compiler.compile_from_file_input(file_input, input_bundle=input_bundle)
+
+
+def test_compile_json_with_experimental_codegen():
+    code = {
+        "language": "Vyper",
+        "sources": {"foo.vy": {"content": "@external\ndef foo() -> bool:\n    return True"}},
+        "settings": {
+            "evmVersion": "cancun",
+            "optimize": "gas",
+            "venom": True,
+            "search_paths": [],
+            "outputSelection": {"*": ["ast"]},
+        },
+    }
+
+    settings = get_settings(code)
+    assert settings.experimental_codegen is True
+
+
+def test_compile_json_with_both_venom_aliases():
+    code = {
+        "language": "Vyper",
+        "sources": {"foo.vy": {"content": ""}},
+        "settings": {
+            "evmVersion": "cancun",
+            "optimize": "gas",
+            "experimentalCodegen": False,
+            "venom": False,
+            "search_paths": [],
+            "outputSelection": {"*": ["ast"]},
+        },
+    }
+    with pytest.raises(JSONError) as e:
+        get_settings(code)
+    assert e.value.args[0] == "both experimentalCodegen and venom cannot be set"

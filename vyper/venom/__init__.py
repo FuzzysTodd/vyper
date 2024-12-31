@@ -5,27 +5,35 @@ from typing import Optional
 
 from vyper.codegen.ir_node import IRnode
 from vyper.compiler.settings import OptimizationLevel
-from vyper.venom.analysis import DFG, calculate_cfg, calculate_liveness
-from vyper.venom.bb_optimizer import (
-    ir_pass_optimize_empty_blocks,
-    ir_pass_optimize_unused_variables,
-    ir_pass_remove_unreachable_blocks,
-)
+from vyper.venom.analysis.analysis import IRAnalysesCache
+from vyper.venom.context import IRContext
 from vyper.venom.function import IRFunction
 from vyper.venom.ir_node_to_venom import ir_node_to_venom
-from vyper.venom.passes.dft import DFTPass
-from vyper.venom.passes.make_ssa import MakeSSA
-from vyper.venom.passes.mem2var import Mem2Var
-from vyper.venom.passes.sccp import SCCP
-from vyper.venom.passes.simplify_cfg import SimplifyCFGPass
+from vyper.venom.passes import (
+    SCCP,
+    AlgebraicOptimizationPass,
+    BranchOptimizationPass,
+    DFTPass,
+    FloatAllocas,
+    LoadElimination,
+    LowerDloadPass,
+    MakeSSA,
+    Mem2Var,
+    MemMergePass,
+    ReduceLiteralsCodesize,
+    RemoveUnusedVariablesPass,
+    SimplifyCFGPass,
+    StoreElimination,
+    StoreExpansionPass,
+)
 from vyper.venom.venom_to_assembly import VenomCompiler
 
 DEFAULT_OPT_LEVEL = OptimizationLevel.default()
 
 
 def generate_assembly_experimental(
-    runtime_code: IRFunction,
-    deploy_code: Optional[IRFunction] = None,
+    runtime_code: IRContext,
+    deploy_code: Optional[IRContext] = None,
     optimize: OptimizationLevel = DEFAULT_OPT_LEVEL,
 ) -> list[str]:
     # note: VenomCompiler is sensitive to the order of these!
@@ -38,73 +46,54 @@ def generate_assembly_experimental(
     return compiler.generate_evm(optimize == OptimizationLevel.NONE)
 
 
-def _run_passes(ctx: IRFunction, optimize: OptimizationLevel) -> None:
+def _run_passes(fn: IRFunction, optimize: OptimizationLevel) -> None:
     # Run passes on Venom IR
     # TODO: Add support for optimization levels
 
-    ir_pass_optimize_empty_blocks(ctx)
-    ir_pass_remove_unreachable_blocks(ctx)
+    ac = IRAnalysesCache(fn)
 
-    internals = [
-        bb
-        for bb in ctx.basic_blocks
-        if bb.label.value.startswith("internal") and len(bb.cfg_in) == 0
-    ]
+    FloatAllocas(ac, fn).run_pass()
 
-    SimplifyCFGPass().run_pass(ctx, ctx.basic_blocks[0])
-    for entry in internals:
-        SimplifyCFGPass().run_pass(ctx, entry)
+    SimplifyCFGPass(ac, fn).run_pass()
+    MakeSSA(ac, fn).run_pass()
+    StoreElimination(ac, fn).run_pass()
+    Mem2Var(ac, fn).run_pass()
+    MakeSSA(ac, fn).run_pass()
+    SCCP(ac, fn).run_pass()
 
-    dfg = DFG.build_dfg(ctx)
-    Mem2Var().run_pass(ctx, ctx.basic_blocks[0], dfg)
-    for entry in internals:
-        Mem2Var().run_pass(ctx, entry, dfg)
+    LoadElimination(ac, fn).run_pass()
+    StoreElimination(ac, fn).run_pass()
+    MemMergePass(ac, fn).run_pass()
+    SimplifyCFGPass(ac, fn).run_pass()
 
-    make_ssa_pass = MakeSSA()
-    make_ssa_pass.run_pass(ctx, ctx.basic_blocks[0])
+    LowerDloadPass(ac, fn).run_pass()
+    AlgebraicOptimizationPass(ac, fn).run_pass()
+    # NOTE: MakeSSA is after algebraic optimization it currently produces
+    #       smaller code by adding some redundant phi nodes. This is not a
+    #       problem for us, but we need to be aware of it, and should be
+    #       removed when the dft pass is fixed to produce the smallest code
+    #       without making the code generation more expensive by running
+    #       MakeSSA again.
+    MakeSSA(ac, fn).run_pass()
+    BranchOptimizationPass(ac, fn).run_pass()
+    RemoveUnusedVariablesPass(ac, fn).run_pass()
 
-    cfg_dirty = False
-    sccp_pass = SCCP(make_ssa_pass.dom)
-    sccp_pass.run_pass(ctx, ctx.basic_blocks[0])
-    cfg_dirty |= sccp_pass.cfg_dirty
+    StoreExpansionPass(ac, fn).run_pass()
 
-    for entry in internals:
-        make_ssa_pass.run_pass(ctx, entry)
-        sccp_pass = SCCP(make_ssa_pass.dom)
-        sccp_pass.run_pass(ctx, entry)
-        cfg_dirty |= sccp_pass.cfg_dirty
+    if optimize == OptimizationLevel.CODESIZE:
+        ReduceLiteralsCodesize(ac, fn).run_pass()
 
-    calculate_cfg(ctx)
-    SimplifyCFGPass().run_pass(ctx, ctx.basic_blocks[0])
-
-    calculate_cfg(ctx)
-    calculate_liveness(ctx)
-
-    while True:
-        changes = 0
-
-        changes += ir_pass_optimize_empty_blocks(ctx)
-        changes += ir_pass_remove_unreachable_blocks(ctx)
-
-        calculate_liveness(ctx)
-
-        changes += ir_pass_optimize_unused_variables(ctx)
-
-        calculate_cfg(ctx)
-        calculate_liveness(ctx)
-
-        changes += DFTPass().run_pass(ctx)
-
-        calculate_cfg(ctx)
-        calculate_liveness(ctx)
-
-        if changes == 0:
-            break
+    DFTPass(ac, fn).run_pass()
 
 
-def generate_ir(ir: IRnode, optimize: OptimizationLevel) -> IRFunction:
+def run_passes_on(ctx: IRContext, optimize: OptimizationLevel):
+    for fn in ctx.functions.values():
+        _run_passes(fn, optimize)
+
+
+def generate_ir(ir: IRnode, optimize: OptimizationLevel) -> IRContext:
     # Convert "old" IR to "new" IR
     ctx = ir_node_to_venom(ir)
-    _run_passes(ctx, optimize)
+    run_passes_on(ctx, optimize)
 
     return ctx

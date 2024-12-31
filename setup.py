@@ -13,15 +13,15 @@ extras_require = {
         "pytest-instafail>=0.4,<1.0",
         "pytest-xdist>=3.0,<3.4",
         "pytest-split>=0.7.0,<1.0",
-        "eth-tester[py-evm]>=0.11.0b1,<0.12",
         "eth_abi>=5.0.0,<6.0.0",
         "py-evm>=0.10.1b1,<0.11",
-        "web3>=7.0.0b4,<8.0",
         "lark==1.1.9",
         "hypothesis[lark]>=6.0,<7.0",
         "eth-stdlib==0.2.7",
+        "eth-account==0.12.2",
         "setuptools",
         "hexbytes>=1.2",
+        "pyrevm>=0.3.2",
     ],
     "lint": [
         "black==23.12.0",
@@ -36,7 +36,7 @@ extras_require = {
 
 extras_require["dev"] = extras_require["dev"] + extras_require["test"] + extras_require["lint"]
 
-with open("README.md", "r") as f:
+with open("README.md", "r", encoding="utf-8") as f:
     long_description = f.read()
 
 
@@ -94,6 +94,7 @@ setup(
         "asttokens>=2.0.5,<3",
         "pycryptodome>=3.5.1,<4",
         "packaging>=23.1,<24",
+        "lark>=1.0.0,<2",
         "importlib-metadata",
         "wheel",
     ],
@@ -105,6 +106,7 @@ setup(
             "vyper=vyper.cli.vyper_compile:_parse_cli_args",
             "fang=vyper.cli.vyper_ir:_parse_cli_args",
             "vyper-json=vyper.cli.vyper_json:_parse_cli_args",
+            "venom=vyper.cli.venom_main:_parse_cli_args",
         ]
     },
     classifiers=[
@@ -113,6 +115,7 @@ setup(
         "Programming Language :: Python :: 3.10",
         "Programming Language :: Python :: 3.11",
         "Programming Language :: Python :: 3.12",
+        "Programming Language :: Python :: 3.13",
     ],
     package_data={"vyper.ast": ["grammar.lark"]},
     data_files=[("", [hash_file_rel_path])],

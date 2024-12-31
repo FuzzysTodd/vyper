@@ -1,45 +1,39 @@
+from functools import cached_property
+
 from vyper.exceptions import CompilerPanic
 from vyper.utils import OrderedSet
+from vyper.venom.analysis import CFGAnalysis, IRAnalysis
 from vyper.venom.basicblock import IRBasicBlock
 from vyper.venom.function import IRFunction
 
 
-class DominatorTree:
+class DominatorTreeAnalysis(IRAnalysis):
     """
     Dominator tree implementation. This class computes the dominator tree of a
     function and provides methods to query the tree. The tree is computed using
     the Lengauer-Tarjan algorithm.
     """
 
-    ctx: IRFunction
+    fn: IRFunction
     entry_block: IRBasicBlock
-    dfs_order: dict[IRBasicBlock, int]
-    dfs_walk: list[IRBasicBlock]
     dominators: dict[IRBasicBlock, OrderedSet[IRBasicBlock]]
     immediate_dominators: dict[IRBasicBlock, IRBasicBlock]
     dominated: dict[IRBasicBlock, OrderedSet[IRBasicBlock]]
     dominator_frontiers: dict[IRBasicBlock, OrderedSet[IRBasicBlock]]
 
-    @classmethod
-    def build_dominator_tree(cls, ctx, entry):
-        ret = DominatorTree()
-        ret.compute(ctx, entry)
-        return ret
-
-    def compute(self, ctx: IRFunction, entry: IRBasicBlock):
+    def analyze(self):
         """
         Compute the dominator tree.
         """
-        self.ctx = ctx
-        self.entry_block = entry
-        self.dfs_order = {}
-        self.dfs_walk = []
+        self.fn = self.function
+        self.entry_block = self.fn.entry
         self.dominators = {}
         self.immediate_dominators = {}
         self.dominated = {}
         self.dominator_frontiers = {}
 
-        self._compute_dfs(self.entry_block, OrderedSet())
+        self.cfg = self.analyses_cache.request_analysis(CFGAnalysis)
+
         self._compute_dominators()
         self._compute_idoms()
         self._compute_df()
@@ -134,28 +128,20 @@ class DominatorTree:
                 bb2 = self.immediate_dominators[bb2]
         return bb1
 
-    def _compute_dfs(self, entry: IRBasicBlock, visited):
-        """
-        Depth-first search to compute the DFS order of the basic blocks. This
-        is used to compute the dominator tree. The sequence of basic blocks in
-        the DFS order is stored in `self.dfs_walk`. The DFS order of each basic
-        block is stored in `self.dfs_order`.
-        """
-        visited.add(entry)
+    @cached_property
+    def dfs_walk(self) -> list[IRBasicBlock]:
+        return list(self.cfg.dfs_walk)
 
-        for bb in entry.cfg_out:
-            if bb not in visited:
-                self._compute_dfs(bb, visited)
-
-        self.dfs_walk.append(entry)
-        self.dfs_order[entry] = len(self.dfs_walk)
+    @cached_property
+    def dfs_order(self) -> dict[IRBasicBlock, int]:
+        return {bb: idx for idx, bb in enumerate(self.dfs_walk)}
 
     def as_graph(self) -> str:
         """
         Generate a graphviz representation of the dominator tree.
         """
         lines = ["digraph dominator_tree {"]
-        for bb in self.ctx.basic_blocks:
+        for bb in self.fn.get_basic_blocks():
             if bb == self.entry_block:
                 continue
             idom = self.immediate_dominator(bb)

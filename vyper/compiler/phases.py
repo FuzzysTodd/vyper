@@ -2,45 +2,27 @@ import copy
 import warnings
 from functools import cached_property
 from pathlib import Path, PurePath
-from typing import Optional
+from typing import Any, Optional
 
+import vyper.codegen.core as codegen
 from vyper import ast as vy_ast
 from vyper.ast import natspec
 from vyper.codegen import module
 from vyper.codegen.ir_node import IRnode
 from vyper.compiler.input_bundle import FileInput, FilesystemInputBundle, InputBundle
-from vyper.compiler.settings import OptimizationLevel, Settings, anchor_settings
-from vyper.exceptions import StructureException
+from vyper.compiler.settings import OptimizationLevel, Settings, anchor_settings, merge_settings
 from vyper.ir import compile_ir, optimizer
+from vyper.ir.compile_ir import reset_symbols
 from vyper.semantics import analyze_module, set_data_positions, validate_compilation_target
+from vyper.semantics.analysis.data_positions import generate_layout_export
+from vyper.semantics.analysis.imports import resolve_imports
 from vyper.semantics.types.function import ContractFunctionT
 from vyper.semantics.types.module import ModuleT
 from vyper.typing import StorageLayout
-from vyper.utils import ERC5202_PREFIX
+from vyper.utils import ERC5202_PREFIX, vyper_warn
 from vyper.venom import generate_assembly_experimental, generate_ir
 
 DEFAULT_CONTRACT_PATH = PurePath("VyperContract.vy")
-
-
-def _merge_one(lhs, rhs, helpstr):
-    if lhs is not None and rhs is not None and lhs != rhs:
-        raise StructureException(
-            f"compiler settings indicate {helpstr} {lhs}, " f"but source pragma indicates {rhs}."
-        )
-    return lhs if rhs is None else rhs
-
-
-# TODO: does this belong as a method under Settings?
-def _merge_settings(cli: Settings, pragma: Settings):
-    ret = Settings()
-    ret.evm_version = _merge_one(cli.evm_version, pragma.evm_version, "evm version")
-    ret.optimize = _merge_one(cli.optimize, pragma.optimize, "optimize")
-    ret.experimental_codegen = _merge_one(
-        cli.experimental_codegen, pragma.experimental_codegen, "experimental codegen"
-    )
-    ret.enable_decimals = _merge_one(cli.enable_decimals, pragma.enable_decimals, "enable-decimals")
-
-    return ret
 
 
 class CompilerData:
@@ -78,6 +60,7 @@ class CompilerData:
         file_input: FileInput | str,
         input_bundle: InputBundle = None,
         settings: Settings = None,
+        integrity_sum: str = None,
         storage_layout: StorageLayout = None,
         show_gas_estimates: bool = False,
         no_bytecode_metadata: bool = False,
@@ -101,7 +84,7 @@ class CompilerData:
 
         if isinstance(file_input, str):
             file_input = FileInput(
-                source_code=file_input,
+                contents=file_input,
                 source_id=-1,
                 path=DEFAULT_CONTRACT_PATH,
                 resolved_path=DEFAULT_CONTRACT_PATH,
@@ -110,10 +93,12 @@ class CompilerData:
         self.storage_layout_override = storage_layout
         self.show_gas_estimates = show_gas_estimates
         self.no_bytecode_metadata = no_bytecode_metadata
-        self.settings = settings or Settings()
+        self.original_settings = settings
         self.input_bundle = input_bundle or FilesystemInputBundle([Path(".")])
+        self.expected_integrity_sum = integrity_sum
 
-        _ = self._generate_ast  # force settings to be calculated
+        # ast cache, hitchhike onto the input_bundle object
+        self.input_bundle._cache._ast_of: dict[int, vy_ast.Module] = {}  # type: ignore
 
     @cached_property
     def source_code(self):
@@ -129,31 +114,71 @@ class CompilerData:
 
     @cached_property
     def _generate_ast(self):
+        is_vyi = self.contract_path.suffix == ".vyi"
+
         settings, ast = vy_ast.parse_to_ast_with_settings(
             self.source_code,
             self.source_id,
-            module_path=str(self.contract_path),
-            resolved_path=str(self.file_input.resolved_path),
+            module_path=self.contract_path.as_posix(),
+            resolved_path=self.file_input.resolved_path.as_posix(),
+            is_interface=is_vyi,
         )
 
-        self.settings = _merge_settings(self.settings, settings)
-        if self.settings.optimize is None:
-            self.settings.optimize = OptimizationLevel.default()
+        if self.original_settings:
+            og_settings = self.original_settings
+            settings = merge_settings(og_settings, settings)
+            assert self.original_settings == og_settings  # be paranoid
+        else:
+            # merge with empty Settings(), doesn't do much but it does
+            # remove the compiler version
+            settings = merge_settings(Settings(), settings)
 
-        if self.settings.experimental_codegen is None:
-            self.settings.experimental_codegen = False
+        if settings.optimize is None:
+            settings.optimize = OptimizationLevel.default()
 
-        # note self.settings.compiler_version is erased here as it is
-        # not used after pre-parsing
-        return ast
+        if settings.experimental_codegen is None:
+            settings.experimental_codegen = False
+
+        return settings, ast
+
+    @cached_property
+    def settings(self):
+        settings, _ = self._generate_ast
+        return settings
 
     @cached_property
     def vyper_module(self):
-        return self._generate_ast
+        _, ast = self._generate_ast
+        return ast
+
+    @cached_property
+    def _resolve_imports(self):
+        # deepcopy so as to not interfere with `-f ast` output
+        vyper_module = copy.deepcopy(self.vyper_module)
+        with self.input_bundle.search_path(Path(vyper_module.resolved_path).parent):
+            return vyper_module, resolve_imports(vyper_module, self.input_bundle)
+
+    @cached_property
+    def resolved_imports(self):
+        imports = self._resolve_imports[1]
+
+        expected = self.expected_integrity_sum
+
+        if expected is not None and imports.integrity_sum != expected:
+            # warn for now. strict/relaxed mode was considered but it costs
+            # interface and testing complexity to add another feature flag.
+            vyper_warn(
+                f"Mismatched integrity sum! Expected {expected}"
+                f" but got {imports.integrity_sum}."
+                " (This likely indicates a corrupted archive)"
+            )
+
+        return imports
 
     @cached_property
     def _annotate(self) -> tuple[natspec.NatspecOutput, vy_ast.Module]:
-        module = generate_annotated_ast(self.vyper_module, self.input_bundle)
+        module = self._resolve_imports[0]
+        analyze_module(module)
         nspec = natspec.parse_natspec(module)
         return nspec, module
 
@@ -172,13 +197,16 @@ class CompilerData:
         required for a compilation target.
         """
         module_t = self.annotated_vyper_module._metadata["type"]
+
         validate_compilation_target(module_t)
         return self.annotated_vyper_module
 
     @cached_property
     def storage_layout(self) -> StorageLayout:
         module_ast = self.compilation_target
-        return set_data_positions(module_ast, self.storage_layout_override)
+        set_data_positions(module_ast, self.storage_layout_override)
+
+        return generate_layout_export(module_ast)
 
     @property
     def global_ctx(self) -> ModuleT:
@@ -241,12 +269,14 @@ class CompilerData:
 
     @cached_property
     def bytecode(self) -> bytes:
-        insert_compiler_metadata = not self.no_bytecode_metadata
-        return generate_bytecode(self.assembly, insert_compiler_metadata=insert_compiler_metadata)
+        metadata = None
+        if not self.no_bytecode_metadata:
+            metadata = bytes.fromhex(self.resolved_imports.integrity_sum)
+        return generate_bytecode(self.assembly, compiler_metadata=metadata)
 
     @cached_property
     def bytecode_runtime(self) -> bytes:
-        return generate_bytecode(self.assembly_runtime, insert_compiler_metadata=False)
+        return generate_bytecode(self.assembly_runtime, compiler_metadata=None)
 
     @cached_property
     def blueprint_bytecode(self) -> bytes:
@@ -257,28 +287,6 @@ class CompilerData:
         deploy_bytecode = b"\x61" + len_bytes + b"\x3d\x81\x60\x0a\x3d\x39\xf3"
 
         return deploy_bytecode + blueprint_bytecode
-
-
-def generate_annotated_ast(vyper_module: vy_ast.Module, input_bundle: InputBundle) -> vy_ast.Module:
-    """
-    Validates and annotates the Vyper AST.
-
-    Arguments
-    ---------
-    vyper_module : vy_ast.Module
-        Top-level Vyper AST node
-
-    Returns
-    -------
-    vy_ast.Module
-        Annotated Vyper AST
-    """
-    vyper_module = copy.deepcopy(vyper_module)
-    with input_bundle.search_path(Path(vyper_module.resolved_path).parent):
-        # note: analyze_module does type inference on the AST
-        analyze_module(vyper_module, input_bundle)
-
-    return vyper_module
 
 
 def generate_ir_nodes(global_ctx: ModuleT, settings: Settings) -> tuple[IRnode, IRnode]:
@@ -301,6 +309,10 @@ def generate_ir_nodes(global_ctx: ModuleT, settings: Settings) -> tuple[IRnode, 
         IR to generate deployment bytecode
         IR to generate runtime bytecode
     """
+    # make IR output the same between runs
+    codegen.reset_names()
+    reset_symbols()
+
     with anchor_settings(settings):
         ir_nodes, ir_runtime = module.generate_ir_for_module(global_ctx)
     if settings.optimize != OptimizationLevel.NONE:
@@ -343,7 +355,7 @@ def _find_nested_opcode(assembly, key):
         return any(_find_nested_opcode(x, key) for x in sublists)
 
 
-def generate_bytecode(assembly: list, insert_compiler_metadata: bool) -> bytes:
+def generate_bytecode(assembly: list, compiler_metadata: Optional[Any]) -> bytes:
     """
     Generate bytecode from assembly instructions.
 
@@ -357,6 +369,4 @@ def generate_bytecode(assembly: list, insert_compiler_metadata: bool) -> bytes:
     bytes
         Final compiled bytecode.
     """
-    return compile_ir.assembly_to_evm(assembly, insert_compiler_metadata=insert_compiler_metadata)[
-        0
-    ]
+    return compile_ir.assembly_to_evm(assembly, compiler_metadata=compiler_metadata)[0]
